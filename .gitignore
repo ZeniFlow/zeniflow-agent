@@ -1,0 +1,4 @@
+/dist/
+/zeniflow-agent
+*.test
+.DS_Store

@@ -1,0 +1,211 @@
+syntax = "proto3";
+
+package zeniflow.agent.v1;
+
+option go_package = "zeniflow/proto/agent/v1;agentv1";
+
+// Связь агента на ноде с панелью. Агент сам подключается к панели (pull-модель), входящие порты на ноде не нужны.
+service AgentService {
+  // Первичная регистрация по одноразовому токену. Вызывается без клиентского сертификата.
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+
+  // Продление клиентского сертификата до истечения. Требует действующий клиентский сертификат; ключ агент оставляет прежний.
+  rpc Renew(RenewRequest) returns (RenewResponse);
+
+  // Постоянный двусторонний поток. Требует клиентский сертификат, выданный при регистрации.
+  // Сейчас агент шлёт heartbeat, панель отвечает Ack. Команды панели добавятся сюда же.
+  rpc Connect(stream AgentMessage) returns (stream ServerMessage);
+}
+
+message NodeInfo {
+  string hostname = 1;
+  string os = 2;
+  string arch = 3;
+  string agent_version = 4;
+  int32 cpu_cores = 5;
+  int64 ram_total_mb = 6;
+  int64 disk_total_gb = 7;
+  // Публичный ключ WireGuard (base64). Закрытый ключ остаётся на ноде. Панель по нему выдаёт адрес в overlay.
+  string wg_public_key = 8;
+  // Состояние правил фаервола (nftables) на ноде: ok | failed | unsupported.
+  string firewall = 9;
+}
+
+message EnrollRequest {
+  string token = 1;
+  // Запрос на сертификат (PKCS#10, DER). Закрытый ключ остаётся на ноде.
+  bytes csr_der = 2;
+  NodeInfo info = 3;
+}
+
+message EnrollResponse {
+  string node_id = 1;
+  bytes client_cert_der = 2;
+  bytes ca_cert_der = 3;
+}
+
+message RenewRequest {
+  // Запрос на сертификат (PKCS#10, DER), подписанный тем же ключом, что и действующий сертификат.
+  bytes csr_der = 1;
+}
+
+message RenewResponse {
+  bytes client_cert_der = 1;
+}
+
+message Heartbeat {
+  NodeInfo info = 1;
+  int64 ram_used_mb = 2;
+  int64 disk_used_gb = 3;
+  double load1 = 4;
+}
+
+message AgentMessage {
+  oneof payload {
+    Heartbeat heartbeat = 1;
+    CommandResult command_result = 2;
+  }
+}
+
+message CreateVM {
+  int32 template_id = 1;
+  string name = 2;
+  int32 cores = 3;
+  int32 memory_mb = 4;
+  int32 disk_gb = 5;
+  string ssh_keys = 6;
+  string password = 7; // пароль root из панели; в логах не показывается
+  string overlay_cidr = 8; // адрес VM в overlay с маской, например 10.99.0.5/16; пусто — без overlay
+}
+
+message VMAction {
+  int32 vmid = 1;
+  string action = 2; // start | stop | shutdown | reboot | delete | status
+}
+
+// Команда панели агенту. Агент отвечает CommandResult с тем же id. Выполняются параллельно: создание VM занимает минуты.
+// Развернуть сайт: собрать образ из репозитория (или взять готовый при откате) и запустить контейнер рядом со старым.
+message DeploySite {
+  string site_id = 1;
+  string deploy_id = 2;
+  string repo_url = 3;
+  string branch = 4;
+  map<string, string> env = 5;
+  int32 cpu_milli = 6;
+  int32 memory_mb = 7;
+  int32 pids = 8;
+  int32 container_port = 9; // 0: определить автоматически
+  int32 host_port = 10;
+  string bind_ip = 11;
+  string image_tag = 12; // для отката: готовый образ вместо сборки
+}
+
+// Создать базу данных: том, контейнер с лимитами, пароль. Образ выбирается агентом по движку и версии из фиксированного списка.
+message DeployDB {
+  string db_id = 1;
+  string engine = 2;  // postgres | mysql | redis
+  string version = 3; // идентификатор версии из списка агента
+  string db_name = 4;
+  string user = 5;
+  string password = 6; // в логах не показывается
+  int32 cpu_milli = 7;
+  int32 memory_mb = 8;
+  int32 pids = 9;
+  int32 host_port = 10;
+  string bind_ip = 11;
+}
+
+message DBAction {
+  string db_id = 1;
+  string action = 2; // stop | start | remove | logs | status | usage | dump | restore
+  int32 lines = 3;   // для logs
+  string engine = 4; // для usage
+  string version = 5;
+  string url = 6;    // для dump: ссылка на загрузку (PUT), для restore: ссылка на скачивание (GET); выдаёт панель
+}
+
+message SiteAction {
+  string site_id = 1;
+  string action = 2; // stop | start | remove | logs | status | images
+  int32 lines = 3;   // для logs
+}
+
+message Command {
+  string id = 1;
+  oneof payload {
+    CreateVM create_vm = 2;
+    VMAction vm_action = 3;
+    DeploySite deploy_site = 4;
+    SiteAction site_action = 5;
+    DeployDB deploy_db = 6;
+    DBAction db_action = 7;
+  }
+}
+
+message CommandResult {
+  string id = 1;
+  bool ok = 2;
+  string error = 3;
+  int32 vmid = 4;       // для create_vm: номер созданной VM
+  string vm_status = 5; // для status: running, stopped и т. д.
+  string output = 6;    // журнал сборки или контейнера, образы через пробел
+  string stack = 7;     // для deploy_site: определённый стек
+  string image_tag = 8; // для deploy_site: собранный образ
+  string commit = 9;
+  int32 container_port = 10;
+  int64 size = 11; // для dump: размер загруженной копии в байтах
+}
+
+// Серверы туннеля (публичные VPS с выделенными IP), к которым агент должен держать соединение. Полный список: лишние закрываются.
+message TunnelConfig {
+  repeated string servers = 1; // host:port
+}
+
+message IPPair {
+  string src = 1;
+  string dst = 2;
+}
+
+message PortPair {
+  string src = 1;
+  string dst = 2;
+  int32 port = 3;
+}
+
+// Сетевая политика ноды: что разрешено VM в overlay. Всё остальное между VM и overlay запрещено.
+message NetworkPolicy {
+  repeated string local_vm_ips = 1;    // адреса VM, которые работают на этой ноде
+  repeated IPPair vm_pairs = 2;        // VM одного клиента: (откуда, куда), обе стороны
+  repeated PortPair port_pairs = 3;    // VM клиента → его базы и сайты (адрес ноды и порт)
+  repeated string gateway_ips = 4;     // шлюзы: им можно обращаться к VM
+  string node_ip = 5;                  // адрес этой ноды в overlay
+}
+
+message Ack {}
+
+message OverlayPeer {
+  string public_key = 1;
+  string overlay_ip = 2;
+  // host:port, если адрес ноды известен панели. Пусто: пир сам подключится к нам.
+  string endpoint = 3;
+  // Адреса VM на этой ноде: пир принимает и отправляет за них трафик (добавляются в AllowedIPs).
+  repeated string routed_ips = 4;
+}
+
+// Полная конфигурация overlay для ноды. Приходит после подключения и при каждом изменении набора нод.
+message OverlayConfig {
+  string address = 1; // адрес этой ноды с маской, например 10.99.0.5/16
+  repeated OverlayPeer peers = 2;
+  // Адреса VM, которые работают на этой ноде: нода маршрутизирует их в мост Proxmox.
+  repeated string local_ips = 3;
+}
+
+message ServerMessage {
+  oneof payload {
+    Ack ack = 1;
+    OverlayConfig overlay = 2;
+    Command command = 3;
+    TunnelConfig tunnel = 4;
+    NetworkPolicy policy = 5;
+  }
+}
